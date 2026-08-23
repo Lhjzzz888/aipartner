@@ -1,11 +1,23 @@
 import streamlit as st
 import os
 from openai import OpenAI
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import logging
+import time
+import struct
 import urllib.request
 import yfinance as yf   # 国际盘兜底数据源
+
+# 融通金官方行情通道依赖（缺依赖时自动降级到其他数据源，不影响启动）
+try:
+    from Crypto.Cipher import Blowfish as _Blowfish
+except ImportError:
+    _Blowfish = None
+try:
+    import websocket as _websocket
+except ImportError:
+    _websocket = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -71,24 +83,23 @@ def delete_session(session_name):
     except Exception as e:
         st.error(f"删除会话失败: {e}")
 
-# ---------- 融通金口径实时行情获取 ----------
-# 数据源说明：融通金平台行情与上海黄金交易所现货/延期报价同步显示，
-# 这里经由新浪财经行情接口获取同一基准价：
-#   黄金 Au99.99 / Au(T+D)（元/克）、白银 Ag(T+D) / Ag99.99（元/千克），
-#   纽约金银（美元/盎司）、美元指数、在岸人民币汇率；
-# 并据此计算国内理论折算价、黄金升贴水与金银比。
-# 任一单项失败只置 None 并逐级兜底，绝不虚构价格。
+# ---------- 融通金官方行情获取（WebSocket 实时通道） ----------
+# 协议逆向自融通金官方 H5 行情页（i.jzj9999.com/quoteh5）：
+#   连接 wss://rtjwbqt.ytj9999.com:8443/gateway →
+#   Blowfish 认证（msgid=32）→ 订阅最新行情（msgid=18）→ 接收 Protobuf 推送。
+# 产品代码：
+#   上金所基准：Au99.99 / Au(T+D)（元/克）、Ag(T+D)（元/千克）
+#   融通金自家报价：JZJ_au_PS/JZJ_au_PB（黄金销售价/回购价，元/克）、
+#                  JZJ_ag_PS/JZJ_ag_PB（白银销售价/回购价，元/克）
+#   国际盘：XAU / XAG（伦敦金银，美元/盎司）、USDCNH（离岸人民币）
+# 官方通道不可用时逐级降级到新浪上金所行情与 yfinance，绝不虚构价格。
 
-_SINA_QUOTE_CODES = {
-    "au9999": "SGE_AU9999",   # 上金所黄金现货 Au99.99（元/克）
-    "autd": "SGE_AUTD",       # 上金所黄金延期 Au(T+D)（元/克）
-    "agtd": "SGE_AGTD",       # 上金所白银延期 Ag(T+D)（元/千克）
-    "ag9999": "SGE_AG9999",   # 上金所白银现货 Ag99.99（元/千克）
-    "intl_gold": "hf_GC",     # 纽约黄金（美元/盎司）
-    "intl_silver": "hf_SI",   # 纽约白银（美元/盎司）
-    "usdcny": "fx_susdcny",   # 美元/在岸人民币
-    "dxy": "DINIW",           # 美元指数
-}
+_RT_WS_URL = "wss://rtjwbqt.ytj9999.com:8443/gateway"
+_RT_KEY = b"tdc5%y4yaU@xFi"
+_RT_IV = b"5X4f$^hp"
+_RT_CODES = ["Au99.99", "Au(T+D)", "Ag(T+D)",
+             "JZJ_au_PS", "JZJ_au_PB", "JZJ_ag_PS", "JZJ_ag_PB",
+             "XAU", "XAG", "USDCNH"]
 
 _OZ_TO_GRAM = 31.1034768     # 1 金衡盎司 = 31.1034768 克
 _GRAMS_PER_KG = 1000.0
@@ -99,6 +110,238 @@ def _to_float(text):
         return float(text)
     except (TypeError, ValueError):
         return None
+
+def _ms_to_bj(ms):
+    """毫秒时间戳 → 北京时间字符串；无效返回 None。"""
+    if not ms:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+# ---- 极简 Protobuf 编码（协议见融通金 H5 前端 jadegold.msg.quotation.pbv2） ----
+def _pb_varint(n):
+    n &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+def _pb_tag(field, wire):
+    return _pb_varint((field << 3) | wire)
+
+def _pb_str(field, s):
+    b = s.encode("utf-8")
+    return _pb_tag(field, 2) + _pb_varint(len(b)) + b
+
+def _pb_bytes(field, b):
+    return _pb_tag(field, 2) + _pb_varint(len(b)) + b
+
+def _pb_msg(field, payload):
+    return _pb_tag(field, 2) + _pb_varint(len(payload)) + payload
+
+def _pb_varint_field(field, v):
+    return _pb_tag(field, 0) + _pb_varint(v)
+
+def _pb_sint32(field, v):
+    return _pb_tag(field, 0) + _pb_varint((v << 1) ^ (v >> 31))
+
+def _pb_packed(field, values):
+    payload = b"".join(_pb_varint(v) for v in values)
+    return _pb_tag(field, 2) + _pb_varint(len(payload)) + payload
+
+def _rt_encode_auth(seq=1):
+    plain = "plaintractrtj" + str(int(time.time() * 1000))
+    pad = 8 - (len(plain) % 8)
+    padded = plain.encode("utf-8") + bytes([pad] * pad)
+    token = _Blowfish.new(_RT_KEY, _Blowfish.MODE_CBC, _RT_IV).encrypt(padded)
+    auth = _pb_str(1, "rtj") + _pb_bytes(2, token)
+    req = _pb_msg(5, auth)              # QuotationRequest.auth
+    return _pb_varint_field(1, 32) + _pb_sint32(2, seq) + _pb_msg(4, req)
+
+def _rt_encode_subscribe(codes, seq=2):
+    req = b"".join(_pb_str(1, c) for c in codes) + _pb_packed(2, [0])  # freq=[REALTIME]
+    return _pb_varint_field(1, 18) + _pb_sint32(2, seq) + _pb_msg(4, req)
+
+# ---- 极简 Protobuf 解码 ----
+def _pb_read_varint(buf, pos):
+    result = 0
+    shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+
+def _pb_skip(buf, pos, wire):
+    if wire == 0:
+        _, pos = _pb_read_varint(buf, pos)
+    elif wire == 1:
+        pos += 8
+    elif wire == 2:
+        ln, pos = _pb_read_varint(buf, pos)
+        pos += ln
+    elif wire == 5:
+        pos += 4
+    return pos
+
+def _rt_parse_realtime(buf):
+    out = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_read_varint(buf, pos)
+        f, w = key >> 3, key & 7
+        if f == 1 and w == 1:
+            out["last"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 2 and w == 2:
+            ln, pos = _pb_read_varint(buf, pos)
+            out["askPrice"] = [struct.unpack("<d", buf[pos + i * 8:pos + i * 8 + 8])[0] for i in range(ln // 8)]
+            pos += ln
+        elif f == 4 and w == 2:
+            ln, pos = _pb_read_varint(buf, pos)
+            out["bidPrice"] = [struct.unpack("<d", buf[pos + i * 8:pos + i * 8 + 8])[0] for i in range(ln // 8)]
+            pos += ln
+        else:
+            pos = _pb_skip(buf, pos, w)
+    return out
+
+def _rt_parse_field(buf):
+    q = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_read_varint(buf, pos)
+        f, w = key >> 3, key & 7
+        if f == 1 and w == 2:
+            ln, pos = _pb_read_varint(buf, pos)
+            q["code"] = buf[pos:pos + ln].decode("utf-8", "ignore"); pos += ln
+        elif f == 3 and w == 1:
+            q["quoteTime"] = struct.unpack("<Q", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 6 and w == 1:
+            q["turnOver"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 7 and w == 2:
+            ln, pos = _pb_read_varint(buf, pos)
+            q["rt"] = _rt_parse_realtime(buf[pos:pos + ln]); pos += ln
+        elif f == 8 and w == 1:
+            q["open"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 9 and w == 1:
+            q["high"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 10 and w == 1:
+            q["low"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 11 and w == 1:
+            q["close"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 12 and w == 1:
+            q["posi"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 13 and w == 1:
+            q["preClose"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        elif f == 14 and w == 1:
+            q["settle"] = struct.unpack("<d", buf[pos:pos + 8])[0]; pos += 8
+        else:
+            pos = _pb_skip(buf, pos, w)
+    return q
+
+def _rt_parse_msg(data):
+    out = {"quotations": [], "hasAuth": False}
+    pos = 0
+    while pos < len(data):
+        key, pos = _pb_read_varint(data, pos)
+        f, w = key >> 3, key & 7
+        if f == 1 and w == 0:
+            out["msgid"], pos = _pb_read_varint(data, pos)
+        elif f == 2 and w == 0:
+            raw, pos = _pb_read_varint(data, pos)
+            out["seq"] = (raw >> 1) ^ -(raw & 1)
+        elif f == 5 and w == 2:
+            ln, pos = _pb_read_varint(data, pos)
+            inner = data[pos:pos + ln]; pos += ln
+            ip = 0
+            while ip < len(inner):
+                k2, ip = _pb_read_varint(inner, ip)
+                f2, w2 = k2 >> 3, k2 & 7
+                if f2 == 1 and w2 == 2:
+                    l2, ip = _pb_read_varint(inner, ip)
+                    out["quotations"].append(_rt_parse_field(inner[ip:ip + l2])); ip += l2
+                elif f2 == 5 and w2 == 2:
+                    l2, ip = _pb_read_varint(inner, ip)
+                    out["hasAuth"] = True; ip += l2
+                else:
+                    ip = _pb_skip(inner, ip, w2)
+        elif f == 9 and w == 2:
+            ln, pos = _pb_read_varint(data, pos)
+            out["jsonResp"] = data[pos:pos + ln].decode("utf-8", "ignore"); pos += ln
+        else:
+            pos = _pb_skip(data, pos, w)
+    return out
+
+def _fetch_rongtong_ws(time_budget=5.5):
+    """连接融通金官方行情网关并抓取快照；失败返回 {}。"""
+    if _websocket is None or _Blowfish is None:
+        logging.warning("融通金行情依赖缺失（websocket-client/pycryptodome），降级到新浪数据源")
+        return {}
+    try:
+        ws = _websocket.create_connection(_RT_WS_URL, timeout=min(4.0, time_budget))
+    except Exception as exc:
+        logging.warning("融通金网关连接失败: %s", exc)
+        return {}
+    try:
+        ws.send(_rt_encode_auth(), opcode=_websocket.ABNF.OPCODE_BINARY)
+        ws.settimeout(min(4.0, time_budget))
+        authed = False
+        deadline = time.time() + time_budget
+        while time.time() < deadline:
+            try:
+                frame = ws.recv()
+            except Exception:
+                break
+            if isinstance(frame, bytes):
+                parsed = _rt_parse_msg(frame)
+                if parsed.get("hasAuth"):
+                    authed = True
+                    break
+        if not authed:
+            logging.warning("融通金网关认证未通过")
+            return {}
+        ws.send(_rt_encode_subscribe(_RT_CODES), opcode=_websocket.ABNF.OPCODE_BINARY)
+        snap = {}
+        while time.time() < deadline and len(snap) < len(_RT_CODES):
+            try:
+                frame = ws.recv()
+            except Exception:
+                break
+            if isinstance(frame, bytes):
+                parsed = _rt_parse_msg(frame)
+                for qf in parsed.get("quotations", []):
+                    code = qf.get("code")
+                    if code and code not in snap:
+                        snap[code] = qf
+        return snap
+    except Exception as exc:
+        logging.warning("融通金行情获取失败: %s", exc)
+        return {}
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+# ---- 新浪财经上金所/国际盘行情（降级数据源） ----
+_SINA_QUOTE_CODES = {
+    "au9999": "SGE_AU9999",   # 上金所黄金现货 Au99.99（元/克）
+    "autd": "SGE_AUTD",       # 上金所黄金延期 Au(T+D)（元/克）
+    "agtd": "SGE_AGTD",       # 上金所白银延期 Ag(T+D)（元/千克）
+    "ag9999": "SGE_AG9999",   # 上金所白银现货 Ag99.99（元/千克）
+    "intl_gold": "hf_XAU",    # 伦敦金（美元/盎司）
+    "intl_silver": "hf_XAG",  # 伦敦银（美元/盎司）
+    "usdcny": "USDCNY",       # 美元/在岸人民币
+    "dxy": "DINIW",           # 美元指数
+}
 
 def _fetch_sina_quotes():
     """获取新浪财经行情原始数据，返回 {code: [字段,...]}；失败返回 {}。"""
@@ -138,30 +381,93 @@ def _yfinance_fallback(ticker):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_quotes():
-    """获取融通金口径行情快照；任何单项失败仅置 None，不影响其余字段。
+    """获取融通金官方口径行情快照；任何单项失败仅置 None，不影响其余字段。
 
     字段说明：
-      au9999 / autd / agtd / ag9999   上金所现货与延期最新价（元/克、元/千克）
-      *_prev                           对应品种昨收价
-      intl_gold / intl_silver          纽约金银（美元/盎司）
-      usdcny / dxy                     在岸汇率 / 美元指数
-      domestic_theoretical             国际金价×汇率折算的理论国内金价（元/克）
-      premium_pct                      黄金升贴水（%）：(国内 − 理论) / 理论 × 100
-      gsr_intl / gsr_domestic          金银比（国际盘 / 国内盘）
-      sge_time / intl_time             数据时间
+      rt_au_ps / rt_au_pb       融通金黄金销售价 / 回购价（元/克）——商户拿货/出货基准
+      rt_ag_ps_kg / rt_ag_pb_kg 融通金白银销售价 / 回购价（元/千克）
+      au9999 / autd / agtd      上金所基准价（元/克、元/千克）
+      intl_gold / intl_silver   伦敦金银（美元/盎司）
+      usdcny / dxy              汇率 / 美元指数
+      domestic_theoretical      国际金价×汇率折算的理论国内金价（元/克）
+      premium_pct               交易所口径黄金升贴水（%）
+      rt_ps_premium_pct         融通金销售价口径升贴水（%）——拿货真实成本
+      rt_spread / rt_spread_pct 融通金回购-销售价差（元/克 与 %）——快进快出摩擦成本
+      gsr_intl / gsr_domestic   金银比（国际盘 / 国内盘）
+      rt_time / sge_time        行情时间（北京时间）
     """
     quotes = {
+        "rt_au_ps": None, "rt_au_pb": None, "rt_ag_ps_kg": None, "rt_ag_pb_kg": None,
         "au9999": None, "au9999_prev": None, "autd": None, "autd_prev": None,
-        "agtd": None, "agtd_prev": None, "ag9999": None, "ag9999_prev": None,
+        "agtd": None, "agtd_prev": None,
         "intl_gold": None, "intl_silver": None, "usdcny": None, "dxy": None,
         "domestic_theoretical": None, "premium_pct": None,
+        "rt_ps_premium_pct": None, "rt_spread": None, "rt_spread_pct": None,
         "gsr_intl": None, "gsr_domestic": None,
-        "sge_time": None, "intl_time": None,
+        "rt_time": None, "sge_time": None, "intl_time": None,
     }
+
+    # ── 第一数据源：融通金官方 WebSocket ──
+    rt = _fetch_rongtong_ws()
+
+    def rt_pick(*codes):
+        for c in codes:
+            q = rt.get(c)
+            if q:
+                r = q.get("rt") or {}
+                last = r.get("last") or q.get("close")
+                return q, last
+        return None, None
+
+    _q, v = rt_pick("JZJ_au_PS")
+    if v is not None:
+        quotes["rt_au_ps"] = v
+        quotes["rt_time"] = quotes["rt_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("JZJ_au_PB")
+    if v is not None:
+        quotes["rt_au_pb"] = v
+        quotes["rt_time"] = quotes["rt_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("JZJ_ag_PS")
+    if v is not None:
+        quotes["rt_ag_ps_kg"] = v * _GRAMS_PER_KG   # 融通金白银按克报价，换算为元/千克
+        quotes["rt_time"] = quotes["rt_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("JZJ_ag_PB")
+    if v is not None:
+        quotes["rt_ag_pb_kg"] = v * _GRAMS_PER_KG
+        quotes["rt_time"] = quotes["rt_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("Au99.99")
+    if v is not None:
+        quotes["au9999"] = v
+        quotes["au9999_prev"] = _to_float(_q.get("preClose"))
+        quotes["sge_time"] = quotes["sge_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("Au(T+D)")
+    if v is not None:
+        quotes["autd"] = v
+        quotes["autd_prev"] = _to_float(_q.get("preClose"))
+        quotes["sge_time"] = quotes["sge_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("Ag(T+D)")
+    if v is not None:
+        quotes["agtd"] = v
+        quotes["agtd_prev"] = _to_float(_q.get("preClose"))
+        quotes["sge_time"] = quotes["sge_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("XAU")
+    if v is not None:
+        quotes["intl_gold"] = v
+        quotes["intl_time"] = quotes["intl_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("XAG")
+    if v is not None:
+        quotes["intl_silver"] = v
+        quotes["intl_time"] = quotes["intl_time"] or _ms_to_bj(_q.get("quoteTime"))
+    _q, v = rt_pick("USDCNH")
+    if v is not None:
+        quotes["usdcny"] = v
+
+    # ── 第二数据源：新浪财经（补齐缺失项 + 美元指数） ──
     raw = _fetch_sina_quotes()
 
-    # 上金所字段映射：最新价=idx3，昨收=idx9，行情时间=idx16
     def read_sge(key, price_idx=3, prev_idx=9, time_idx=16):
+        if quotes[key] is not None:
+            return
         fields = raw.get(_SINA_QUOTE_CODES[key])
         if not fields or len(fields) <= max(price_idx, time_idx):
             return
@@ -176,48 +482,51 @@ def get_market_quotes():
     read_sge("au9999")
     read_sge("autd")
     read_sge("agtd")
-    read_sge("ag9999")
 
-    # 纽约金银字段映射：最新价=idx0，时间=idx6，日期=idx12
-    gold = raw.get(_SINA_QUOTE_CODES["intl_gold"])
-    if gold and len(gold) > 12:
-        price = _to_float(gold[0])
-        if price is not None:
-            quotes["intl_gold"] = price
-            quotes["intl_time"] = f"{gold[12]} {gold[6]}".strip()
-    silver = raw.get(_SINA_QUOTE_CODES["intl_silver"])
-    if silver and len(silver) > 12:
-        price = _to_float(silver[0])
-        if price is not None:
-            quotes["intl_silver"] = price
-
-    # 汇率 / 美元指数字段映射：最新值=idx1
-    fx = raw.get(_SINA_QUOTE_CODES["usdcny"])
-    if fx and len(fx) > 1:
-        quotes["usdcny"] = _to_float(fx[1])
+    if quotes["intl_gold"] is None:
+        gold = raw.get(_SINA_QUOTE_CODES["intl_gold"])
+        if gold and len(gold) > 12:
+            price = _to_float(gold[0])
+            if price is not None:
+                quotes["intl_gold"] = price
+                quotes["intl_time"] = quotes["intl_time"] or f"{gold[12]} {gold[6]}".strip()
+    if quotes["intl_silver"] is None:
+        silver = raw.get(_SINA_QUOTE_CODES["intl_silver"])
+        if silver and len(silver) > 12:
+            price = _to_float(silver[0])
+            if price is not None:
+                quotes["intl_silver"] = price
+                quotes["intl_time"] = quotes["intl_time"] or f"{silver[12]} {silver[6]}".strip()
+    if quotes["usdcny"] is None:
+        fx = raw.get(_SINA_QUOTE_CODES["usdcny"])
+        if fx and len(fx) > 1:
+            quotes["usdcny"] = _to_float(fx[1])
     dxy = raw.get(_SINA_QUOTE_CODES["dxy"])
     if dxy and len(dxy) > 1:
         quotes["dxy"] = _to_float(dxy[1])
 
-    # ── 国际盘兜底：yfinance ──
+    # ── 第三数据源：yfinance 兜底 ──
     if quotes["intl_gold"] is None:
         fallback = _yfinance_fallback("GC=F") or _yfinance_fallback("GLD")
         if fallback is not None:
-            # GLD 一份约等于 1/10 金衡盎司
             quotes["intl_gold"] = fallback * 10 if fallback < 1000 else fallback
-            quotes["intl_time"] = "yfinance 最新收盘"
+            quotes["intl_time"] = quotes["intl_time"] or "yfinance 最新收盘"
     if quotes["intl_silver"] is None:
         quotes["intl_silver"] = _yfinance_fallback("SI=F")
     if quotes["usdcny"] is None:
         quotes["usdcny"] = _yfinance_fallback("CNY=X")
 
-    # ── 衍生计算：升贴水 / 金银比 ──
+    # ── 衍生计算：升贴水 / 价差 / 金银比 ──
     if quotes["intl_gold"] and quotes["usdcny"]:
         theoretical = quotes["intl_gold"] * quotes["usdcny"] / _OZ_TO_GRAM
         quotes["domestic_theoretical"] = theoretical
-        domestic = quotes["au9999"] if quotes["au9999"] is not None else quotes["autd"]
-        if domestic:
-            quotes["premium_pct"] = (domestic / theoretical - 1) * 100
+        if quotes["au9999"]:
+            quotes["premium_pct"] = (quotes["au9999"] / theoretical - 1) * 100
+        if quotes["rt_au_ps"]:
+            quotes["rt_ps_premium_pct"] = (quotes["rt_au_ps"] / theoretical - 1) * 100
+    if quotes["rt_au_ps"] and quotes["rt_au_pb"]:
+        quotes["rt_spread"] = quotes["rt_au_ps"] - quotes["rt_au_pb"]
+        quotes["rt_spread_pct"] = quotes["rt_spread"] / quotes["rt_au_pb"] * 100
     if quotes["intl_gold"] and quotes["intl_silver"]:
         quotes["gsr_intl"] = quotes["intl_gold"] / quotes["intl_silver"]
     if (quotes["au9999"] or quotes["autd"]) and quotes["agtd"]:
@@ -226,62 +535,88 @@ def get_market_quotes():
     return quotes
 
 def build_price_message(q):
-    """把行情快照组装成注入给模型的系统消息（融通金基准口径）。"""
+    """把行情快照组装成注入给模型的系统消息（融通金官方口径）。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [f"【融通金基准行情】以下为 {now} 获取的实时/最近收盘行情，请以此为准进行判断，严禁使用内部训练数据中的历史价格。"]
+    lines = [f"【融通金官方实时行情】以下为 {now} 获取的实时/最近行情，请以此为准进行判断，严禁使用内部训练数据中的历史价格。"]
 
-    if q["au9999"] is not None:
-        chg = (q["au9999"] - q["au9999_prev"]) if q["au9999_prev"] else None
-        chg_text = f"（较昨收 {chg:+.2f} 元/克）" if chg is not None else ""
-        lines.append(f"· 黄金 Au99.99（现货）：{q['au9999']:.2f} 元/克{chg_text}，行情时间 {q['sge_time']}（来源：上海黄金交易所，融通金平台同步基准）")
-    if q["autd"] is not None:
-        chg = (q["autd"] - q["autd_prev"]) if q["autd_prev"] else None
-        chg_text = f"（较昨收 {chg:+.2f} 元/克）" if chg is not None else ""
-        lines.append(f"· 黄金 Au(T+D)（延期）：{q['autd']:.2f} 元/克{chg_text}，行情时间 {q['sge_time']}")
-    if q["agtd"] is not None:
-        chg = (q["agtd"] - q["agtd_prev"]) if q["agtd_prev"] else None
-        chg_text = f"（较昨收 {chg:+.2f} 元/千克）" if chg is not None else ""
-        lines.append(f"· 白银 Ag(T+D)（延期）：{q['agtd']:.2f} 元/千克{chg_text}，行情时间 {q['sge_time']}")
-    if q["ag9999"] is not None and q["agtd"] is None:
-        lines.append(f"· 白银 Ag99.99（现货）：{q['ag9999']:.2f} 元/千克，行情时间 {q['sge_time']}")
-    if q["intl_gold"] is not None:
-        lines.append(f"· 国际黄金（纽约）：{q['intl_gold']:.2f} 美元/盎司，时间 {q['intl_time']}")
-    if q["intl_silver"] is not None:
-        lines.append(f"· 国际白银（纽约）：{q['intl_silver']:.2f} 美元/盎司，时间 {q['intl_time']}")
-    if q["usdcny"] is not None:
-        lines.append(f"· 美元/人民币（在岸）：{q['usdcny']:.4f}")
-    if q["dxy"] is not None:
-        lines.append(f"· 美元指数（DXY）：{q['dxy']:.2f}")
-    if q["domestic_theoretical"] is not None:
-        lines.append(f"· 国际金价折算理论国内价：{q['domestic_theoretical']:.2f} 元/克")
-    if q["premium_pct"] is not None:
-        lines.append(f"· 黄金升贴水：{q['premium_pct']:+.2f}%（国内价 − 理论折算价；≤+1% 拿货划算可补库存，+1%~+3% 正常周转，≥+3% 仅补周转不囤货，贴水为逢低拿货窗口）")
+    if any(v is not None for v in (q["rt_au_ps"], q["rt_au_pb"], q["rt_ag_ps_kg"], q["rt_ag_pb_kg"])):
+        if q["rt_time"]:
+            lines.append(f"（融通金平台报价时间：{q['rt_time']}，来源：融通金官方行情通道）")
+        lines.append("─ 融通金官方报价（商户买卖基准）─")
+        if q["rt_au_ps"] is not None:
+            lines.append(f"· 黄金销售价（拿货价）：{q['rt_au_ps']:.2f} 元/克")
+        if q["rt_au_pb"] is not None:
+            lines.append(f"· 黄金回购价（出货价）：{q['rt_au_pb']:.2f} 元/克")
+        if q["rt_spread"] is not None:
+            lines.append(f"· 回购-销售价差：{q['rt_spread']:.2f} 元/克（{q['rt_spread_pct']:+.2f}%，快进快出的摩擦成本）")
+        if q["rt_ag_ps_kg"] is not None:
+            lines.append(f"· 白银销售价（拿货价）：{q['rt_ag_ps_kg']:.0f} 元/千克（{q['rt_ag_ps_kg'] / _GRAMS_PER_KG:.2f} 元/克）")
+        if q["rt_ag_pb_kg"] is not None:
+            lines.append(f"· 白银回购价（出货价）：{q['rt_ag_pb_kg']:.0f} 元/千克（{q['rt_ag_pb_kg'] / _GRAMS_PER_KG:.2f} 元/克）")
+
+    if any(v is not None for v in (q["au9999"], q["autd"], q["agtd"])):
+        if q["sge_time"]:
+            lines.append(f"─ 上金所基准行情（时间 {q['sge_time']}）─")
+        else:
+            lines.append("─ 上金所基准行情 ─")
+        if q["au9999"] is not None:
+            chg = (q["au9999"] - q["au9999_prev"]) if q["au9999_prev"] else None
+            chg_text = f"（较昨收 {chg:+.2f} 元/克）" if chg is not None else ""
+            lines.append(f"· 黄金 Au99.99：{q['au9999']:.2f} 元/克{chg_text}")
+        if q["autd"] is not None:
+            chg = (q["autd"] - q["autd_prev"]) if q["autd_prev"] else None
+            chg_text = f"（较昨收 {chg:+.2f} 元/克）" if chg is not None else ""
+            lines.append(f"· 黄金 Au(T+D)：{q['autd']:.2f} 元/克{chg_text}")
+        if q["agtd"] is not None:
+            chg = (q["agtd"] - q["agtd_prev"]) if q["agtd_prev"] else None
+            chg_text = f"（较昨收 {chg:+.2f} 元/千克）" if chg is not None else ""
+            lines.append(f"· 白银 Ag(T+D)：{q['agtd']:.2f} 元/千克{chg_text}")
+
+    if any(v is not None for v in (q["intl_gold"], q["intl_silver"], q["usdcny"], q["dxy"])):
+        lines.append("─ 国际盘与汇率 ─")
+        if q["intl_gold"] is not None:
+            lines.append(f"· 国际黄金（伦敦）：{q['intl_gold']:.2f} 美元/盎司（时间 {q['intl_time']}）")
+        if q["intl_silver"] is not None:
+            lines.append(f"· 国际白银（伦敦）：{q['intl_silver']:.2f} 美元/盎司（时间 {q['intl_time']}）")
+        if q["usdcny"] is not None:
+            lines.append(f"· 美元/人民币：{q['usdcny']:.4f}")
+        if q["dxy"] is not None:
+            lines.append(f"· 美元指数（DXY）：{q['dxy']:.2f}")
+
+    if any(v is not None for v in (q["domestic_theoretical"], q["premium_pct"], q["rt_ps_premium_pct"])):
+        lines.append("─ 升贴水与比价 ─")
+        if q["domestic_theoretical"] is not None:
+            lines.append(f"· 国际金价折算理论国内价：{q['domestic_theoretical']:.2f} 元/克")
+        if q["premium_pct"] is not None:
+            lines.append(f"· 交易所口径升贴水（Au99.99 vs 折算价）：{q['premium_pct']:+.2f}%")
+        if q["rt_ps_premium_pct"] is not None:
+            lines.append(f"· 融通金销售价口径升贴水（拿货真实成本）：{q['rt_ps_premium_pct']:+.2f}%（≤0% 拿货划算，0%~+2% 正常周转，≥+2% 仅补最低周转量）")
     if q["gsr_intl"] is not None:
         lines.append(f"· 金银比（国际盘）：{q['gsr_intl']:.1f}")
     if q["gsr_domestic"] is not None:
         lines.append(f"· 金银比（国内盘）：{q['gsr_domestic']:.1f}")
 
-    if not any(v is not None for v in (q["au9999"], q["autd"], q["agtd"], q["ag9999"])):
+    if not any(v is not None for v in (q["rt_au_ps"], q["rt_au_pb"], q["au9999"], q["autd"], q["agtd"])):
         lines.append("⚠️ 本次未能获取融通金/上金所人民币报价：严禁编造国内金银价格。如需报价判断，仅可基于国际价×汇率折算，并明确标注“折算参考价，非融通金实时价”。")
-    if q["premium_pct"] is None and any(v is not None for v in (q["au9999"], q["autd"])):
-        lines.append("（本次缺少汇率或国际金价，升贴水无法计算，请在回答中标注该数据待核实。）")
+    if q["rt_au_ps"] is None and q["au9999"] is not None:
+        lines.append("（本次未能获取融通金官方销售/回购价，仅有上金所基准价，请按上金所口径判断并在回答中注明。）")
     return "\n".join(lines)
 
-# ---------- 完整系统提示词（已包含通俗化要求与融通金基准铁律） ----------
+# ---------- 完整系统提示词（融通金官方口径 + 商户视角） ----------
 system_prompt = '''
-你是{nick}，一位{nature}的贵金属定价资深策略分析师。你的分析底层逻辑基于**三因子定价模型**：黄金以“实际利率”为唯一核心锚，白银在此基础上叠加“工业需求弹性”，而“资金拥挤度”仅作为赔率修正项介入决策；在此之上，一切**实物买卖判断**都必须再经过【融通金实物视角校验】（第四步），方向结论与实物校验冲突时，实际拿货决策以第四步为准。
+你是{nick}，一位{nature}的贵金属定价资深策略分析师，服务于**黄金白银商户（商贩）**。你的分析底层逻辑基于**三因子定价模型**：黄金以“实际利率”为唯一核心锚，白银在此基础上叠加“工业需求弹性”，而“资金拥挤度”仅作为赔率修正项介入决策；在此之上，一切**实物买卖判断**都必须再经过【融通金实物视角校验】（第四步），方向结论与实物校验冲突时，实际拿货决策以第四步为准。
 
-**重要输出要求**：所有分析结论必须用**通俗易懂的语言**向普通投资者阐述，避免堆砌专业术语，但核心逻辑必须严谨、数据必须有据可查。
+**重要输出要求**：所有分析结论必须用**通俗易懂的语言**输出，避免堆砌专业术语，但核心逻辑必须严谨、数据必须有据可查。所有价格建议必须落到**商户可执行的动作**：拿货、出货、囤货、补周转，并给出数量幅度（如“仅补一周周转量”）。
 
 ════════════════════════════════
-【价格基准铁律 · 融通金优先】（最高优先级，任何情况下不得违反）
+【价格基准铁律 · 融通金官方报价优先】（最高优先级，任何情况下不得违反）
 ════════════════════════════════
-1. 涉及黄金白银的**买卖价格判断**，一律以**融通金（上海黄金交易所现货/延期）人民币报价**为准：
-   - 黄金基准：Au99.99 / Au(T+D)，单位元/克；
-   - 白银基准：Ag(T+D)，单位元/千克。
-2. 国际美元报价（纽约COMEX/LBMA）仅用于**趋势归因与换算**，绝不直接当作国内可成交价。
-3. 每次价格判断必须完整列出四要素：**融通金价 + 国际价 + 美元/人民币汇率 + 升贴水(%)**；缺任何一项，必须标注“[数据待核实]”，严禁用历史数据填充或估算。
-4. 融通金平台自身升贴水以平台实时显示为准；平台数据不可得时，以上金所价格作基准并在结论中注明。
+1. 一切买卖判断以**融通金官方实时报价**为第一基准：黄金看「销售价/回购价」（元/克），白银看销售价/回购价（克价×1000=元/千克）。
+2. 用户是商户：**拿货按销售价买入，出货按回购价卖出**，两者价差=一进一出的摩擦成本；凡建议快进快出，必须先核对价差能否覆盖。
+3. 行情形势判断以上金所 **Au99.99 / Au(T+D) / Ag(T+D)** 为第二基准（趋势、涨跌幅、较昨收变化）。
+4. 国际美元报价（伦敦/纽约）仅用于**趋势归因与换算**，绝不直接当作国内可成交价。
+5. 每次价格判断必须完整列出：**融通金销售价/回购价 + 上金所基准价 + 国际价 + 汇率 + 升贴水(%)**；缺任何一项必须标注“[数据待核实]”，严禁用历史数据填充或估算。
+6. 白银计价注意：国内银价含增值税（13%），长期结构性高于国际折算价约10%-13%，判断银价贵贱必须用“含税理论价”对比，切勿把增值税部分误读为超高升水。报价必须标明单位（元/克 或 元/千克）。
 
 **数据公信力铁律**：
 - 所有结论性数据（TIPS利率、PMI、CFTC持仓、ETF持仓、金银比、上金所库存仓单、TD递延费方向）必须标注具体数据来源（机构名称+发布日期）。
@@ -371,15 +706,16 @@ system_prompt = '''
 
 **核心逻辑**：前三步决定国际趋势方向与弹性，本步决定**国内实物拿货/囤货/出货的实际操作**。方向再对，升贴水与季节性不对，也不动手。
 
-**必须完成的核查项（共5项，逐项给出结论）**：
+**必须完成的核查项（共6项，逐项给出结论）**：
 
-1. **内外盘升贴水**：
-   - 计算方式：升贴水 = (国内人民币价 − 国际价×汇率折算价) ÷ 折算价 × 100%（黄金基准用Au99.99；白银注意国内价含增值税，长期结构性高于国际折算价约10%-13%，判断时以黄金升贴水为主、白银升贴水只看边际变化）。
-   - 阈值判定：≤+1% → 拿货成本划算，适合补库存；+1%~+3% → 成本正常，按周转需求拿货；≥+3% → 拿货成本过高，仅补最低周转量，坚决不囤货；贴水（<0）→ 逢低拿货窗口。
-2. **汇率传导**：人民币贬值（USD/CNY上行）→ 国内金银涨幅大于国际盘，囤货享双重收益；人民币升值（USD/CNY下行）→ 国内涨幅被压缩，谨慎囤货。结论必须写明当前汇率方向。
-3. **TD递延费方向**：Au(T+D)/Ag(T+D) 延期补偿费持续“多付空”→ 现货偏紧、易涨；持续“空付多”→ 现货过剩、承压。数据不可得时标注“[数据待核实]”。
-4. **上金所库存与仓单**：库存/注册仓单连续下降 → 现货偏紧、价格易涨；持续累积 → 现货过剩、拿货不用急（周度观察）。数据不可得时标注“[数据待核实]”。
-5. **消费季节性**：淡季（3-4月、7-8月）需求疲软、升水压低 → 年度备货窗口；旺季（9月-次年2月，含国庆、春节、婚嫁季）需求旺盛、升水走高 → 出货变现窗口。回答时结合当前日期说明所处季节段。
+1. **内外盘升贴水（双口径，拿货口径最关键）**：
+   - 口径A（拿货口径）：融通金销售价升贴水 = (融通金黄金销售价 − 国际金×汇率折算价) ÷ 折算价 × 100%。阈值：≤0% → 拿货划算、果断补库存；0%~+2% → 成本正常，按周转需求拿货；≥+2% → 拿货成本偏高，仅补最低周转量，不囤货；≤-1%（明显贴水）→ 逢低备货窗口。
+   - 口径B（交易所口径）：上金所Au99.99升贴水，用于判断市场情绪——持续高升水=现货紧张抢货，持续贴水=现货充裕。
+2. **回购-销售价差（摩擦成本）**：价差（元/克）即快进快出的一进一出成本；价差走阔→平台流动性转差或波动加大，快进快出策略收紧；价差收窄→交易环境友好，可提高周转频率。
+3. **汇率传导**：人民币贬值（USD/CNY上行）→ 国内金银涨幅大于国际盘，囤货享双重收益；人民币升值 → 国内涨幅被压缩，谨慎囤货。结论必须写明当前汇率方向。
+4. **TD递延费方向**：Au(T+D)/Ag(T+D) 延期补偿费持续“多付空”→ 现货偏紧、易涨；持续“空付多”→ 现货过剩、承压。数据不可得时标注“[数据待核实]”。
+5. **上金所库存与仓单**：库存/注册仓单连续下降 → 现货偏紧、价格易涨；持续累积 → 现货过剩、拿货不用急（周度观察）。数据不可得时标注“[数据待核实]”。
+6. **消费季节性**：淡季（3-4月、7-8月）需求疲软、升水压低 → 年度备货窗口；旺季（9月-次年2月，含国庆、春节、婚嫁季）需求旺盛、升水走高 → 出货变现窗口。回答时结合当前日期说明所处季节段。
 
 ---
 
@@ -387,9 +723,9 @@ system_prompt = '''
 
 | 决策场景 | 优先核查顺序 |
 | :--- | :--- |
-| 月度大批量囤货 | 实际利率 → 美联储政策预期 → 人民币汇率 → 消费季节性 → 升贴水 |
-| 周度周转补货 | 融通金实时价 → 汇率 → 升贴水 → CFTC/ETF持仓 → 当周风险事件 |
-| 日常快进快出 | 融通金实时价 → 汇率 → 升贴水 |
+| 月度大批量囤货 | 实际利率 → 美联储政策预期 → 人民币汇率 → 消费季节性 → 融通金销售价升贴水 |
+| 周度周转补货 | 融通金销售/回购价 → 汇率 → 升贴水 → CFTC/ETF持仓 → 当周风险事件 |
+| 日常快进快出 | 融通金销售价 → 回购价 → 回购-销售价差 → 汇率 → 升贴水 |
 
 ---
 
@@ -403,20 +739,20 @@ system_prompt = '''
 | **第二步** | 加权PMI | [数值] / [趋势：上升/下降/持平] | [来源+日期] |
 | **第三步-黄金** | CFTC黄金净多头分位 | [数值]% / [拥挤度判定] | [来源+日期] |
 | **第三步-白银** | 金银比 | [数值] / [绝对值阈值+历史分位判定] | [来源+日期] |
-| **第四步** | 升贴水/汇率/季节性 | [升贴水%] / [汇率方向] / [当前季节段+备货结论] | [来源+日期] |
+| **第四步** | 升贴水/价差/汇率/季节性 | [销售价升贴水%] / [价差元/克] / [汇率方向] / [季节段+备货结论] | [来源+日期] |
 
 **决策规则**：
 - **黄金最终方向**：直接继承第一步TIPS的判定结论（下降→看多；上升→看空；震荡→观望）。
 - **黄金仓位调整**：根据第三步拥挤度判定，在基准仓位基础上调整（低赔率→减仓；高赔率→加仓）。
 - **白银相对方向**：第二步判定跑赢黄金 → 优先配置白银ETF或银矿股；判定跑输黄金 → 优先配置黄金资产或做空金银比。
 - **白银仓位调整**：如果第一步看多黄金且第二步判定白银跑赢 → 最强配置信号；如果第一步看空黄金且第二步判定白银跑输 → 最强做空信号。
-- **实物贸易裁决（最高优先）**：升贴水、递延费方向、季节性与上述方向结论冲突时，**实际拿货决策以第四步为准**——例如趋势看多但升水≥3%且处于淡季，结论应为“趋势看多，但暂不囤货，仅保周转，等待升水回落/旺季启动”。
+- **实物贸易裁决（最高优先）**：升贴水、价差、递延费方向、季节性与上述方向结论冲突时，**实际拿货决策以第四步为准**——例如趋势看多但销售价升水≥2%且处于淡季，结论应为“趋势看多，但暂不囤货，仅保周转，等待升水回落/旺季启动”。
 
 ---
 
 ### 输出格式要求
 
-**严格按以下五级标题结构输出（总字数1000-1800字），但语言必须通俗易懂，避免过度使用专业术语，要像给朋友解释一样清晰**：
+**严格按以下六级标题结构输出（总字数1000-1800字），但语言必须通俗易懂，避免过度使用专业术语，要像给朋友解释一样清晰**：
 
 ### 一、核心结论（不超过150字）
 - 黄金方向与关键支撑/阻力逻辑（一句话，用比喻或常识解释）。
@@ -432,15 +768,18 @@ system_prompt = '''
 | 金银比 | XX.X | X%分位 | 银被低估/高估/中性 | XXX |
 | GLD持仓30日变化 | +X吨 | - | 流入/流出/持平 | XXX |
 
-### 三、融通金价格基准面板（表格形式）
+### 三、融通金价格基准面板（表格形式，商户买卖直接使用）
 | 项目 | 数值 | 备注 |
 | :--- | :--- | :--- |
-| 黄金 Au99.99（元/克） | [数值] | [较昨收涨跌] |
-| 黄金 Au(T+D)（元/克） | [数值] | [较昨收涨跌] |
-| 白银 Ag(T+D)（元/千克） | [数值] | [较昨收涨跌] |
-| 国际黄金（美元/盎司） | [数值] | - |
-| 美元/人民币（在岸） | [数值] | [升/贬值方向] |
-| 黄金升贴水 | [+X.X%] | [拿货性价比判定] |
+| 黄金销售价（拿货价） | [数值] 元/克 | [较平台前值变化] |
+| 黄金回购价（出货价） | [数值] 元/克 | [较平台前值变化] |
+| 回购-销售价差 | [数值] 元/克 | [快进快出摩擦成本判定] |
+| 白银销售/回购价 | [数值] 元/千克 | [克价换算] |
+| 上金所 Au99.99 / Au(T+D) | [数值] 元/克 | [较昨收涨跌] |
+| 白银 Ag(T+D) | [数值] 元/千克 | [较昨收涨跌] |
+| 国际金银（伦敦） | [数值] 美元/盎司 | - |
+| 美元/人民币 | [数值] | [升/贬值方向] |
+| 升贴水（销售价口径/交易所口径） | [+X.X% / +X.X%] | [拿货性价比判定] |
 
 ### 四、策略建议与风险提示（用“大白话”写）
 - **黄金策略**：入场参考区间（基于β弹性反推TIPS利率对应的价格区间）、止损参考（基于ATR%）、目标位（基于当前TIPS利率向历史均值回归的假设）。尽量用“如果价格跌到XXX，可以考虑买”这种句式。
@@ -450,8 +789,8 @@ system_prompt = '''
   2. [具体事件] → 对工业需求的潜在冲击方向。
   3. [具体事件] → 对资金拥挤度的突发逆转风险。
 
-### 五、融通金视角实物决策（一句话）
-- 以商户口吻给出：当前【适不适合拿货/囤货/出货】+ 一句话理由（升贴水/季节性/汇率），以及建议动作幅度（例：“仅补一周周转量”、“等待9月旺季再出货”）。
+### 五、融通金视角实物决策（商户口吻，一句话+动作幅度）
+- 给出当前【适不适合拿货/囤货/出货】+ 一句话理由（销售价升贴水/价差/季节性/汇率），以及建议动作幅度（例：“销售价992、回购价990，价差2元，仅补一周周转量”、“升水回到+2%以内再谈囤货”）。
 
 ### 六、数据来源与验证状态
 - 已验证数据项（来源+发布时间）。
@@ -459,9 +798,9 @@ system_prompt = '''
 
 ---
 
-**性格设定**：{nature}、数据洁癖、坚持“方向源于利率、弹性源于景气、仓位源于赔率、拿货源于升贴水与季节”的四层决策链，不做模糊的“中性”建议（若确实无方向则明确建议“离场观望”）。
+**性格设定**：{nature}、数据洁癖、坚持“方向源于利率、弹性源于景气、仓位源于赔率、拿货源于融通金升贴水与季节”的四层决策链，不做模糊的“中性”建议（若确实无方向则明确建议“离场观望”）。
 
-**执行指令**：用户提问后立即按上述四步框架生成分析。若用户仅问黄金或仅问白银，仍需完整执行第一步、第三步和第四步（黄金相关的数据项），第二步仅当问题涉及白银或金银比时才需完整展开。用户问价时：先报融通金基准价（元/克、元/千克）与国际价（美元/盎司）及升贴水，再给出判断。
+**执行指令**：用户提问后立即按上述四步框架生成分析。若用户仅问黄金或仅问白银，仍需完整执行第一步、第三步和第四步（黄金相关的数据项），第二步仅当问题涉及白银或金银比时才需完整展开。用户问价时：先报融通金销售价/回购价（元/克）与上金所基准价，再报国际价、汇率与升贴水，然后给出判断。
 
 **最后强调**：**所有分析结论必须用通俗易懂的语言输出，就像向非专业人士解释一样，避免堆砌术语，但核心逻辑必须严谨。**
 '''
@@ -532,7 +871,7 @@ if prompt:
     if not st.session_state.current_session:
         st.session_state.current_session = generate_session_name()
 
-    # ---- 获取融通金口径实时行情并注入 ----
+    # ---- 获取融通金官方实时行情并注入 ----
     price_msg = {
         "role": "system",
         "content": build_price_message(get_market_quotes())
