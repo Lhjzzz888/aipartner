@@ -4,8 +4,15 @@ from datetime import date
 import hashlib
 import json
 import logging
+from pathlib import Path
+import sys
 
 import streamlit as st
+
+# Streamlit Cloud adds the entrypoint's directory, not necessarily the repo root.
+repo_root = str(Path(__file__).resolve().parent.parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from driving_school_rights.deepseek import AnalysisError, analyze_case, build_payload
 from driving_school_rights.documents import DocumentError, extract_document, sanitize_text
@@ -194,3 +201,4 @@ def _fallback_config():
 
 def main():
     """Streamlit entry point; UI is rendered by module execution."""
+
