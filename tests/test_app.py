@@ -5,7 +5,7 @@ from types import ModuleType
 
 from streamlit.testing.v1 import AppTest
 
-from driving_school_rights.deepseek import AnalysisError
+from driving_school_rights.deepseek import AnalysisError, AssistantResult
 from driving_school_rights.documents import ExtractedDocument
 from driving_school_rights.guidance import CaseFacts
 
@@ -71,6 +71,27 @@ def test_chat_input_accepts_question_without_documents(monkeypatch):
     assert "没留证据，先从今天开始补" in app.session_state["chat_messages"][-1]["content"]
 
 
+def test_chat_question_calls_deepseek_immediately(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    seen = []
+
+    def fake_analysis(client, payload, model):
+        seen.append(payload)
+        return AssistantResult("针对本次提问的事实整理", ["付款时间是什么时候？"], [], "先书面联系驾校", [], {}, [])
+
+    monkeypatch.setattr("driving_school_rights.deepseek.analyze_case", fake_analysis)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint).run()
+    app.chat_input[0].set_value("教练态度差，我没证据怎么办？").run()
+    assert not app.exception
+    assert len(seen) == 1
+    assert "教练态度差" in seen[0][1]["content"]
+    assert "针对本次提问的事实整理" in app.session_state["chat_messages"][-1]["content"]
+
+
 def test_confirmed_evidence_reaches_analysis(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     fake_openai = ModuleType("openai")
@@ -96,21 +117,12 @@ def test_confirmed_evidence_reaches_analysis(monkeypatch):
     assert any("已进入分析步骤" in error.value for error in app.error)
 
 
-def test_text_only_case_can_reach_analysis(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
-    fake_openai = ModuleType("openai")
-    fake_openai.OpenAI = lambda **kwargs: object()
-    monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr(
-        "driving_school_rights.deepseek.analyze_case",
-        lambda *args: (_ for _ in ()).throw(AnalysisError("已进入分析步骤")),
-    )
+def test_text_only_case_does_not_require_upload_confirmation(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
     app = AppTest.from_file(entrypoint)
     app.session_state["case_facts"] = CaseFacts("其他", None, "没有合同，驾校不退费")
     app.run()
-    next(box for box in app.checkbox if "确认将其发送给 DeepSeek" in box.label).set_value(True).run()
-    next(button for button in app.button if button.label == "确认并分析").click().run()
     assert not app.exception
-    assert any("已进入分析步骤" in error.value for error in app.error)
+    assert not any(button.label == "确认并分析" for button in app.button)
 
