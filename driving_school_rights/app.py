@@ -146,7 +146,7 @@ if case:
                 st.error("尚未配置 DeepSeek API Key。请由部署管理员在服务端环境变量中配置后再分析。")
             else:
                 try:
-                    laws = search_laws(f"{case.description if case else ''} {preview}", case.issue_type if case else "", load_laws(), date.today())
+                    laws = search_laws(f"{case.description if case else ''} {preview_excerpt}", case.issue_type if case else "", load_laws(), date.today())
                     active_case = case or CaseFacts("其他", None, "")
                     active_plan = build_negotiation_plan(active_case)
                     routes = recommend_routes(active_case)
