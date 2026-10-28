@@ -1,0 +1,8 @@
+[
+  {"name":"交通运输服务监督热线","phone":"12328","website":"https://xxgk.mot.gov.cn/2020/xzgfxwj/202304/t20230424_3809195.html","scope":"交通运输行业咨询、投诉、举报和意见建议；可咨询驾培监管线索","verified_at":"2026-10-28","source_url":"https://xxgk.mot.gov.cn/2020/xzgfxwj/202304/t20230424_3809195.html","is_official":true,"city":null},
+  {"name":"全国12315平台","phone":"12315","website":"https://www.12315.cn/","scope":"消费纠纷投诉或涉嫌违法行为举报；两者应按诉求分别选择","verified_at":"2026-10-28","source_url":"https://www.12315.cn/","is_official":true,"city":null},
+  {"name":"山东省政务服务便民热线","phone":"12345","website":"https://zwfw.sd.gov.cn/col/col2410/index.html","scope":"咨询政策、反映政务服务诉求或请求转至属地主管部门","verified_at":"2026-10-28","source_url":"https://zwfw.sd.gov.cn/col/col2410/index.html","is_official":true,"city":null},
+  {"name":"公共法律服务热线","phone":"12348","website":"https://www.moj.gov.cn/","scope":"法律咨询、公共法律服务指引；法律援助需另行审核法定条件","verified_at":"2026-10-28","source_url":"https://www.moj.gov.cn/pub/sfbgw/zwxxgk/fdzdgknr/fdzdgknrlzyj/lzyjsfhybzj/202311/W020231120690971564428.pdf","is_official":true,"city":null},
+  {"name":"人民法院诉讼服务热线","phone":"12368","website":"https://www.court.gov.cn/","scope":"诉讼程序咨询、案件信息和法院诉讼服务；具体受理范围以当地法院为准","verified_at":"2026-10-28","source_url":"https://www.court.gov.cn/fabu/xiangqing/13612.html","is_official":true,"city":null},
+  {"name":"公安报警电话","phone":"110","website":"https://bjca.miit.gov.cn/zwgk/tzgg/art/2022/art_8d4eb93ee3424f30826c97ee400e8937.html","scope":"仅用于正在发生的人身安全危险、暴力威胁等紧急情况；一般合同争议不适用","verified_at":"2026-10-28","source_url":"https://bjca.miit.gov.cn/zwgk/tzgg/art/2022/art_8d4eb93ee3424f30826c97ee400e8937.html","is_official":true,"city":null}
+]
