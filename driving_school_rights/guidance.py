@@ -52,3 +52,21 @@ def build_negotiation_plan(case: CaseFacts) -> NegotiationPlan:
     first = "先核对合同、付款、已学课时和退费计算依据，再形成书面诉求。" if case.confirmed_amount is None else "整理合同、付款和履约证据，向驾校提交书面诉求并要求书面答复。"
     amount = case.confirmed_amount
     return NegotiationPlan(first, "要求驾校按合同及实际履行情况提出退费或补救方案" + (f"，暂列金额 {amount:g} 元" if amount is not None else "，金额待核对"), "如不能一次解决，可提出分期退费、转校/转教练或补足课时等可核实的备选方案。", evidence, ("核对合同和金额", "向驾校负责人书面协商", "保留送达和回复记录", "必要时依次使用12328、12315或12345等渠道", "评估调解、仲裁条款或诉讼"), amount)
+
+
+def quick_chat_reply(case: CaseFacts) -> str:
+    """Give a short, practical starting point without requiring documents."""
+    question = case.description
+    steps = []
+    if any(word in question for word in ("没合同", "没有合同", "合同丢", "没签合同", "未签合同")):
+        steps.append("**没有合同也可以先处理。** 请驾校书面说明是否签过合同；如签过，索取副本，如没签过，请其提供收费项目和退费计算说明。同时找付款记录、报名页面、收据和聊天记录，核对已学课时。不要猜测合同条款。")
+    if any(word in question for word in ("没证据", "没有证据", "没留证据", "没记录", "没截图", "没有截图")):
+        steps.append("**没留证据，先从今天开始补。** 按日期写下报名、付款、约课和争议经过；查找银行/微信/支付宝付款记录、预约记录和通知；把诉求发给驾校负责人并保存送达与回复。只记录真实发生的事，不补造材料。")
+    if case.urgent_safety_risk:
+        steps.insert(0, "**如正在遭遇人身危险，先离开现场；必要时拨打 110。**")
+    plan = build_negotiation_plan(case)
+    steps.append(f"**先这样协商：** {plan.first_step} {plan.primary_request} 请驾校给出书面答复。")
+    steps.append("**协商不成：** 教学、培训记录等问题可向 12328 反映；消费服务争议可向 12315 投诉；不清楚主管部门可拨 12345。具体渠道和法律依据请看下方展开内容。")
+    steps.append("**下一步请补充：** 驾校在哪个市、付款多少、学到哪个阶段，以及你希望退费、换教练还是继续培训？不知道的可以直接说不知道。")
+    return "\n\n".join(steps)
+
