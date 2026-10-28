@@ -1,8 +1,13 @@
 from pathlib import Path
 import subprocess
 import sys
+from types import ModuleType
 
 from streamlit.testing.v1 import AppTest
+
+from driving_school_rights.deepseek import AnalysisError
+from driving_school_rights.documents import ExtractedDocument
+from driving_school_rights.guidance import CaseFacts
 
 
 def test_home_shows_privacy_boundary_without_api_key(monkeypatch):
@@ -44,4 +49,29 @@ def test_case_intake_renders_routes_without_calling_api(monkeypatch):
     assert not app.exception
     assert any("先协商" in heading.value for heading in app.subheader)
     assert any("12328" in expander.label for expander in app.expander)
+
+
+def test_confirmed_evidence_reaches_analysis(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    def stop_before_network(*args):
+        raise AnalysisError("已进入分析步骤")
+
+    monkeypatch.setattr("driving_school_rights.deepseek.analyze_case", stop_before_network)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint)
+    app.session_state["case_facts"] = CaseFacts("驾校违约/退费", "济南", "预约课程被取消")
+    app.session_state["extracted_documents"] = [
+        ExtractedDocument("合同.txt", "txt", "驾校承诺按时安排训练")
+    ]
+
+    app.run()
+    next(box for box in app.checkbox if "确认将其发送给 DeepSeek" in box.label).set_value(True).run()
+    next(button for button in app.button if button.label == "确认并分析").click().run()
+
+    assert not app.exception
+    assert any("已进入分析步骤" in error.value for error in app.error)
 
