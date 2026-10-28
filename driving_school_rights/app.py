@@ -14,21 +14,29 @@ repo_root = str(Path(__file__).resolve().parent.parent)
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from driving_school_rights.deepseek import AnalysisError, analyze_case, build_payload
+from driving_school_rights.deepseek import AnalysisError, analyze_case, build_payload, format_chat_result
 from driving_school_rights.documents import DocumentError, extract_document, sanitize_text
 from driving_school_rights.export import export_document
 from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, quick_chat_reply, recommend_routes
 from driving_school_rights.knowledge import get_contacts, load_contacts, load_laws, search_laws
 from driving_school_rights.config import ConfigError, load_config
+from driving_school_rights.limits import BudgetError, check_request_budget
 
 
 logger = logging.getLogger(__name__)
+
+
+def _fallback_config():
+    from driving_school_rights.config import AppConfig
+    return AppConfig("", "", "", 10, 30, 15000, 5, 100)
+
+
 st.set_page_config(page_title="山东学车权益助手", page_icon="⚖️", layout="centered")
 st.title("山东学车权益助手")
 st.caption("直接说遇到了什么。没有合同、没有截图，也可以先问。")
 st.warning("本工具提供一般法律信息和文书草稿，不代替律师、行政机关或法院作出法律结论。")
 with st.expander("材料与隐私说明"):
-    st.write("首版不设账号，不保存服务器端聊天历史或上传原文件。解析仅在当前会话内存中进行；发送前会展示并允许编辑实际发送的摘录，只有你勾选确认并点击发送后才调用 DeepSeek。请先遮盖无关个人信息。第三方服务的数据处理受其账户配置和服务政策约束。")
+    st.write("发送聊天问题时，文字会直接提交给 DeepSeek 分析。上传原文件只在当前会话内存中解析；文件摘录会先展示供你编辑，只有勾选确认并点击分析后才发送。请先遮盖无关个人信息。首版不设账号，不保存服务器端聊天历史；第三方服务的数据处理受其账户配置和服务政策约束。")
 
 try:
     config = load_config()
@@ -40,7 +48,7 @@ except ConfigError as exc:
 if config_error:
     st.info(config_error)
 
-cities = ["济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安", "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽"]
+cities = ["未确定", "济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安", "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽"]
 issues = ["驾校违约/退费", "教练态度或教学问题", "培训安排/转校", "培训记录或课时争议", "其他"]
 
 st.session_state.setdefault("chat_messages", [])
@@ -54,7 +62,8 @@ if not st.session_state["chat_messages"]:
 for message in st.session_state["chat_messages"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-typed_prompt = st.chat_input("说说你遇到的问题，例如：驾校不退费，我没合同", max_chars=4000)
+st.caption("发送文字问题后会立即调用 DeepSeek；请勿输入身份证号、银行卡号等无关个人信息。")
+typed_prompt = st.chat_input("直接问，例如：教练态度差，我没留证据怎么办？", max_chars=4000)
 if typed_prompt:
     prompt = typed_prompt
 if prompt:
@@ -63,14 +72,35 @@ if prompt:
         earlier_questions = [message["content"] for message in st.session_state["chat_messages"] if message["role"] == "user"]
         context = "\n".join((earlier_questions + [question])[-3:])[:4000]
         issue_for_chat = "教练态度或教学问题" if "教练" in context else "驾校违约/退费" if any(word in context for word in ("退费", "退款", "违约")) else "其他"
-        case_for_chat = CaseFacts(issue_for_chat, st.session_state.get("city"), context)
-        answer = quick_chat_reply(case_for_chat)
+        chosen_city = st.session_state.get("city")
+        case_for_chat = CaseFacts(issue_for_chat, chosen_city if chosen_city in cities[1:] else None, context)
         st.session_state["case_facts"] = case_for_chat
         st.session_state.pop("analysis_result", None)
-        for role, content in (("user", question), ("assistant", answer)):
-            st.session_state["chat_messages"].append({"role": role, "content": content})
-            with st.chat_message(role):
-                st.markdown(content)
+        st.session_state["chat_messages"].append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            if config:
+                with st.spinner("正在结合已核验法规分析..."):
+                    try:
+                        check_request_budget(st.session_state, config)
+                        laws = search_laws(context, issue_for_chat, load_laws(), date.today())
+                        payload = build_payload(case_for_chat, "", laws, recommend_routes(case_for_chat), build_negotiation_plan(case_for_chat))
+                        from openai import OpenAI
+                        result = analyze_case(OpenAI(api_key=config.api_key, base_url=config.api_base_url, timeout=60, max_retries=1), payload, config.model)
+                        st.session_state["analysis_result"] = result
+                        answer = format_chat_result(result)
+                    except BudgetError as exc:
+                        answer = f"AI 咨询次数已用完：{exc}\n\n以下是基础指引：\n\n{quick_chat_reply(case_for_chat)}"
+                    except AnalysisError as exc:
+                        answer = f"{exc}\n\n以下是基础指引：\n\n{quick_chat_reply(case_for_chat)}"
+                    except Exception as exc:
+                        logger.warning("Chat analysis failed (%s)", type(exc).__name__)
+                        answer = f"AI 暂时无法回答，请稍后重试。以下是基础指引：\n\n{quick_chat_reply(case_for_chat)}"
+            else:
+                answer = "AI 尚未配置；以下是基础指引：\n\n" + quick_chat_reply(case_for_chat)
+            st.markdown(answer)
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
 
 with st.expander("可选：补充所在地、付款和培训进度"):
     with st.form("case_intake"):
@@ -92,7 +122,7 @@ if case_submitted:
         except ValueError:
             st.error("付款金额请填写非负数字，或留空。")
             amount = None
-    case = CaseFacts(issue, city, description.strip(), amount, urgent, training_progress=progress.strip())
+    case = CaseFacts(issue, city if city != "未确定" else None, description.strip(), amount, urgent, training_progress=progress.strip())
     st.session_state["case_facts"] = case
     st.session_state.pop("analysis_result", None)
 
@@ -154,14 +184,14 @@ if case:
         edited = st.text_area("识别文字（可编辑）", value=document.text, height=180, key=f"edited_{index}", max_chars=15000)
         excerpts.append(f"【{document.filename}】\n{edited}")
 
-    if case:
+    if excerpts:
         merged_excerpt = "\n\n".join(excerpts)
         redaction_values = st.text_input("选择遮盖的内容（多个内容用中文或英文逗号分隔）", key="redaction_values", help="例如电话号码、身份证号。遮盖只应用于下方展示并发送的摘录。")
         values = [item.strip() for item in redaction_values.replace("，", ",").split(",") if item.strip()]
         preview_excerpt = sanitize_text(merged_excerpt, values)
         st.markdown("**发送前预览**")
-        st.caption("只有勾选并点击下方按钮后，案情文字及已上传材料的摘录才会发送给 DeepSeek。没有材料时只发送你输入的案情。")
-        st.code(preview_excerpt or "未上传材料；仅发送上方输入的案情。", language=None)
+        st.caption("核对并确认后，案情文字及下方材料摘录才会发送给 DeepSeek。")
+        st.code(preview_excerpt, language=None)
         consent_context = {
             "city": case.city if case else city,
             "issue": case.issue_type if case else issue,
@@ -178,6 +208,7 @@ if case:
                 st.error("尚未配置 DeepSeek API Key。请由部署管理员在服务端环境变量中配置后再分析。")
             else:
                 try:
+                    check_request_budget(st.session_state, config)
                     laws = search_laws(f"{case.description if case else ''} {preview_excerpt}", case.issue_type if case else "", load_laws(), date.today())
                     active_case = case or CaseFacts("其他", None, "")
                     active_plan = build_negotiation_plan(active_case)
@@ -189,36 +220,38 @@ if case:
                     st.session_state["confirmed_excerpt"] = preview_excerpt
                 except AnalysisError as exc:
                     st.error(str(exc))
+                except BudgetError as exc:
+                    st.error(str(exc))
                 except Exception as exc:
                     logger.warning("Analysis setup failed (%s)", type(exc).__name__)
                     st.error("无法连接分析服务，请稍后重试。")
 
 result = st.session_state.get("analysis_result")
 if result:
-    st.subheader("分析结果（请核对事实与适用性）")
-    st.markdown("**事实梳理**")
-    st.write(result.fact_summary)
-    if result.questions:
-        st.markdown("**还需要补充**")
-        for question in result.questions:
-            st.write(f"- {question}")
-    st.markdown("**法规依据**")
-    if result.legal_basis:
-        for law in result.legal_basis:
-            st.write(f"{law.get('title', '')} {law.get('article', '')}：{law.get('summary', '')}")
-            if law.get("source_url"):
-                st.markdown(f"[官方来源]({law['source_url']})")
-    else:
-        st.info("未检索到已核验的匹配法条；具体依据尚待核实。")
-    st.markdown("**协商建议**")
-    st.write(result.negotiation)
-    for uncertainty in result.uncertainties:
-        st.warning(uncertainty)
-    st.subheader("生成可编辑文书")
-    doc_type = st.selectbox("文书类型", ["协商函", "退费/解除合同请求", "12328情况反映稿", "12315投诉稿"], key="doc_type")
-    for kind, mime, extension in [("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"), ("txt", "text/plain; charset=utf-8", "txt")]:
-        data = export_document(result, kind, doc_type)
-        st.download_button(f"下载 {kind.upper()}", data, file_name=f"{doc_type}.{extension}", mime=mime, key=f"download_{kind}")
+    with st.expander("查看完整分析并下载文书草稿"):
+        st.markdown("**事实梳理**")
+        st.write(result.fact_summary)
+        if result.questions:
+            st.markdown("**还需要补充**")
+            for question in result.questions:
+                st.write(f"- {question}")
+        st.markdown("**法规依据**")
+        if result.legal_basis:
+            for law in result.legal_basis:
+                st.write(f"{law.get('title', '')} {law.get('article', '')}：{law.get('summary', '')}")
+                if law.get("source_url"):
+                    st.markdown(f"[官方来源]({law['source_url']})")
+        else:
+            st.info("未检索到已核验的匹配法条；具体依据尚待核实。")
+        st.markdown("**协商建议**")
+        st.write(result.negotiation)
+        for uncertainty in result.uncertainties:
+            st.warning(uncertainty)
+        st.markdown("**生成可编辑文书**")
+        doc_type = st.selectbox("文书类型", ["协商函", "退费/解除合同请求", "12328情况反映稿", "12315投诉稿"], key="doc_type")
+        for kind, mime, extension in [("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"), ("txt", "text/plain; charset=utf-8", "txt")]:
+            data = export_document(result, kind, doc_type)
+            st.download_button(f"下载 {kind.upper()}", data, file_name=f"{doc_type}.{extension}", mime=mime, key=f"download_{kind}")
 
 if st.button("清除本次材料和分析"):
     for key in ("extracted_documents", "analysis_result", "confirmed_excerpt", "case_facts", "chat_messages", "send_preview", "redaction_values", "confirm_send"):
@@ -227,11 +260,6 @@ if st.button("清除本次材料和分析"):
         if key.startswith("confirm_send_"):
             st.session_state.pop(key, None)
     st.rerun()
-
-
-def _fallback_config():
-    from driving_school_rights.config import AppConfig
-    return AppConfig("", "", "", 10, 30, 15000, 5, 100)
 
 
 def main():
