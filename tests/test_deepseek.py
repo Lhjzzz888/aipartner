@@ -41,6 +41,16 @@ def test_no_match_says_unverified():
     assert "未检索到" in payload[0]["content"]
 
 
+def test_model_cannot_replace_verified_law_text_or_link():
+    case, laws, routes, plan = _inputs()
+    assert laws
+    response = {"fact_summary": "待核实", "questions": [], "legal_basis": [{"id": laws[0].id, "title": "伪造标题", "article": "第一千条", "summary": "保证退款", "source_url": "https://fake.example"}], "negotiation": "先沟通", "routes": [], "document_fields": {}, "uncertainties": []}
+    result = analyze_case(_client(json.dumps(response, ensure_ascii=False)), build_payload(case, "", laws, routes, plan), "deepseek-flash")
+    assert result.legal_basis[0]["title"] == laws[0].title
+    assert result.legal_basis[0]["article"] == laws[0].article
+    assert result.legal_basis[0]["source_url"] == laws[0].source_url
+
+
 def test_missing_facts_returns_questions():
     case, laws, routes, plan = _inputs()
     response = {"fact_summary":"合同待核实", "questions":["已付款多少？"], "legal_basis":[], "negotiation":"先核对合同", "routes":[], "document_fields":{}, "uncertainties":[]}
@@ -64,3 +74,4 @@ def _client(content):
     message = SimpleNamespace(content=content)
     choice = SimpleNamespace(message=message)
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(choices=[choice]))))
+
