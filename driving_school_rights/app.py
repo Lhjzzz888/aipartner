@@ -17,7 +17,7 @@ if repo_root not in sys.path:
 from driving_school_rights.deepseek import AnalysisError, analyze_case, build_payload
 from driving_school_rights.documents import DocumentError, extract_document, sanitize_text
 from driving_school_rights.export import export_document
-from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, recommend_routes
+from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, quick_chat_reply, recommend_routes
 from driving_school_rights.knowledge import get_contacts, load_contacts, load_laws, search_laws
 from driving_school_rights.config import ConfigError, load_config
 
@@ -25,9 +25,9 @@ from driving_school_rights.config import ConfigError, load_config
 logger = logging.getLogger(__name__)
 st.set_page_config(page_title="山东学车权益助手", page_icon="⚖️", layout="centered")
 st.title("山东学车权益助手")
-st.caption("帮你梳理驾校培训争议、准备协商方案、维权路径和文书草稿。")
+st.caption("直接说遇到了什么。没有合同、没有截图，也可以先问。")
 st.warning("本工具提供一般法律信息和文书草稿，不代替律师、行政机关或法院作出法律结论。")
-with st.expander("材料与隐私说明", expanded=True):
+with st.expander("材料与隐私说明"):
     st.write("首版不设账号，不保存服务器端聊天历史或上传原文件。解析仅在当前会话内存中进行；发送前会展示并允许编辑实际发送的摘录，只有你勾选确认并点击发送后才调用 DeepSeek。请先遮盖无关个人信息。第三方服务的数据处理受其账户配置和服务政策约束。")
 
 try:
@@ -43,14 +43,44 @@ if config_error:
 cities = ["济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安", "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽"]
 issues = ["驾校违约/退费", "教练态度或教学问题", "培训安排/转校", "培训记录或课时争议", "其他"]
 
-with st.form("case_intake"):
-    city = st.selectbox("驾校所在地", cities, key="city")
-    issue = st.selectbox("主要问题", issues, key="issue")
-    description = st.text_area("简单描述发生了什么", max_chars=4000, key="description")
-    amount_raw = st.text_input("你核实过的付款金额（元，可留空）", key="confirmed_amount")
-    progress = st.text_input("培训进度（可留空）", key="training_progress")
-    urgent = st.checkbox("目前存在正在发生的人身安全危险", key="urgent_safety_risk")
-    case_submitted = st.form_submit_button("整理情况与建议")
+st.session_state.setdefault("chat_messages", [])
+prompt = None
+if not st.session_state["chat_messages"]:
+    st.markdown("**可以这样问：**")
+    if st.button("我没有合同，怎么退费？", key="example_contract"):
+        prompt = "我没有合同，怎么退费？"
+    if st.button("教练态度很差，我没留证据怎么办？", key="example_evidence"):
+        prompt = "教练态度很差，我没留证据怎么办？"
+for message in st.session_state["chat_messages"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+typed_prompt = st.chat_input("说说你遇到的问题，例如：驾校不退费，我没合同", max_chars=4000)
+if typed_prompt:
+    prompt = typed_prompt
+if prompt:
+    question = prompt.strip()[:4000]
+    if question:
+        earlier_questions = [message["content"] for message in st.session_state["chat_messages"] if message["role"] == "user"]
+        context = "\n".join((earlier_questions + [question])[-3:])[:4000]
+        issue_for_chat = "教练态度或教学问题" if "教练" in context else "驾校违约/退费" if any(word in context for word in ("退费", "退款", "违约")) else "其他"
+        case_for_chat = CaseFacts(issue_for_chat, st.session_state.get("city"), context)
+        answer = quick_chat_reply(case_for_chat)
+        st.session_state["case_facts"] = case_for_chat
+        st.session_state.pop("analysis_result", None)
+        for role, content in (("user", question), ("assistant", answer)):
+            st.session_state["chat_messages"].append({"role": role, "content": content})
+            with st.chat_message(role):
+                st.markdown(content)
+
+with st.expander("可选：补充所在地、付款和培训进度"):
+    with st.form("case_intake"):
+        city = st.selectbox("驾校所在地", cities, key="city")
+        issue = st.selectbox("主要问题", issues, key="issue")
+        description = st.text_area("简单描述发生了什么", max_chars=4000, key="description")
+        amount_raw = st.text_input("你核实过的付款金额（元，可留空）", key="confirmed_amount")
+        progress = st.text_input("培训进度（可留空）", key="training_progress")
+        urgent = st.checkbox("目前存在正在发生的人身安全危险", key="urgent_safety_risk")
+        case_submitted = st.form_submit_button("更新情况与建议")
 
 if case_submitted:
     amount = None
@@ -68,33 +98,35 @@ if case_submitted:
 
 case = st.session_state.get("case_facts")
 if case:
-    st.subheader("先协商，再按问题选择渠道")
-    plan = build_negotiation_plan(case)
-    st.write(f"**第一步：** {plan.first_step}")
-    st.write(f"**主要诉求：** {plan.primary_request}")
-    st.write(f"**备选方案：** {plan.alternative}")
-    with st.expander("准备证据清单"):
+    with st.expander("查看详细方案、维权电话和官方入口"):
+        st.subheader("详细方案和联系方式")
+        plan = build_negotiation_plan(case)
+        st.write(f"**第一步：** {plan.first_step}")
+        st.write(f"**主要诉求：** {plan.primary_request}")
+        st.write(f"**备选方案：** {plan.alternative}")
+        st.markdown("**准备证据清单**")
         for entry in plan.evidence:
             st.write(f"- {entry}")
-    st.markdown("**常用维权路径（需根据具体事实选择）**")
-    for route in recommend_routes(case):
-        with st.expander(f"{route.channel}｜{route.when_to_use}"):
+        st.markdown("**常用维权路径（需根据具体事实选择）**")
+        for route in recommend_routes(case):
+            st.markdown(f"**{route.channel}｜{route.when_to_use}**")
             st.write("办理步骤：" + "；".join(route.steps))
             st.write("准备材料：" + "；".join(route.prepare))
             st.caption(route.limitations)
-    contacts = get_contacts(case.city, case.issue_type, load_contacts(), date.today())
-    st.markdown("**官方联系方式**")
-    for contact in contacts:
-        if contact.unverified_local:
-            st.caption(f"未核验到{case.city}市专属号码，以下为官方通用入口。")
-            break
-    for contact in contacts:
-        st.write(f"**{contact.name}：{contact.phone or '在线入口'}** — {contact.scope}")
-        if contact.website:
-            st.markdown(f"[官方来源/入口]({contact.website})")
-        st.caption(f"來源核验日期：{contact.verified_at.isoformat()}")
+        contacts = get_contacts(case.city, case.issue_type, load_contacts(), date.today())
+        st.markdown("**官方联系方式**")
+        for contact in contacts:
+            if contact.unverified_local:
+                st.caption(f"未核验到{case.city}市专属号码，以下为官方通用入口。")
+                break
+        for contact in contacts:
+            st.write(f"**{contact.name}：{contact.phone or '在线入口'}** — {contact.scope}")
+            if contact.website:
+                st.markdown(f"[官方来源/入口]({contact.website})")
+            st.caption(f"来源核验日期：{contact.verified_at.isoformat()}")
 
-    st.subheader("上传合同、聊天记录等材料")
+    st.subheader("可选：上传合同、聊天记录等材料")
+    st.caption("没有材料也可以继续咨询；之后找到材料再上传。")
     uploads = st.file_uploader("支持 PDF、DOCX、TXT、PNG、JPG；文件仅在当前会话内存中处理", type=["pdf", "docx", "txt", "png", "jpg", "jpeg"], accept_multiple_files=True, max_upload_size=config.max_upload_mb if config else 10, key="evidence_uploads")
     if st.button("读取材料并进入校对", disabled=not uploads):
         extracted = []
@@ -122,14 +154,14 @@ if case:
         edited = st.text_area("识别文字（可编辑）", value=document.text, height=180, key=f"edited_{index}", max_chars=15000)
         excerpts.append(f"【{document.filename}】\n{edited}")
 
-    if excerpts:
+    if case:
         merged_excerpt = "\n\n".join(excerpts)
         redaction_values = st.text_input("选择遮盖的内容（多个内容用中文或英文逗号分隔）", key="redaction_values", help="例如电话号码、身份证号。遮盖只应用于下方展示并发送的摘录。")
         values = [item.strip() for item in redaction_values.replace("，", ",").split(",") if item.strip()]
         preview_excerpt = sanitize_text(merged_excerpt, values)
         st.markdown("**发送前预览**")
-        st.caption("确认后，所在地、问题类型、你填写的案情描述/培训进度，以及下方材料摘录会一并发送给 DeepSeek。请检查上方表单和下方完整摘录。")
-        st.code(preview_excerpt, language=None)
+        st.caption("只有勾选并点击下方按钮后，案情文字及已上传材料的摘录才会发送给 DeepSeek。没有材料时只发送你输入的案情。")
+        st.code(preview_excerpt or "未上传材料；仅发送上方输入的案情。", language=None)
         consent_context = {
             "city": case.city if case else city,
             "issue": case.issue_type if case else issue,
@@ -189,8 +221,11 @@ if result:
         st.download_button(f"下载 {kind.upper()}", data, file_name=f"{doc_type}.{extension}", mime=mime, key=f"download_{kind}")
 
 if st.button("清除本次材料和分析"):
-    for key in ("extracted_documents", "analysis_result", "confirmed_excerpt", "case_facts", "send_preview", "redaction_values", "confirm_send"):
+    for key in ("extracted_documents", "analysis_result", "confirmed_excerpt", "case_facts", "chat_messages", "send_preview", "redaction_values", "confirm_send"):
         st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key.startswith("confirm_send_"):
+            st.session_state.pop(key, None)
     st.rerun()
 
 
