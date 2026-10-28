@@ -20,7 +20,7 @@ from driving_school_rights.export import export_document
 from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, quick_chat_reply, recommend_routes
 from driving_school_rights.knowledge import get_contacts, load_contacts, load_laws, search_laws
 from driving_school_rights.config import ConfigError, load_config
-from driving_school_rights.limits import BudgetError, check_request_budget
+from driving_school_rights.limits import BudgetError, check_request_budget, clear_case_state
 
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ if not st.session_state["chat_messages"]:
 for message in st.session_state["chat_messages"]:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-st.caption("发送文字问题后会立即调用 DeepSeek；请勿输入身份证号、银行卡号等无关个人信息。")
+st.caption("发送后会调用 DeepSeek；连续追问会附带最近三条提问和已提交的补充信息。请勿输入无关个人信息。")
 typed_prompt = st.chat_input("直接问，例如：教练态度差，我没留证据怎么办？", max_chars=4000)
 if typed_prompt:
     prompt = typed_prompt
@@ -70,10 +70,17 @@ if prompt:
     question = prompt.strip()[:4000]
     if question:
         earlier_questions = [message["content"] for message in st.session_state["chat_messages"] if message["role"] == "user"]
-        context = "\n".join((earlier_questions + [question])[-3:])[:4000]
-        issue_for_chat = "教练态度或教学问题" if "教练" in context else "驾校违约/退费" if any(word in context for word in ("退费", "退款", "违约")) else "其他"
-        chosen_city = st.session_state.get("city")
-        case_for_chat = CaseFacts(issue_for_chat, chosen_city if chosen_city in cities[1:] else None, context)
+        form_case = st.session_state.get("form_case_facts")
+        context_parts = ([form_case.description] if form_case and form_case.description else []) + (earlier_questions + [question])[-3:]
+        context = "\n".join(context_parts)[-4000:]
+        issue_for_chat = "教练态度或教学问题" if "教练" in context else "驾校违约/退费" if any(word in context for word in ("退费", "退款", "违约")) else form_case.issue_type if form_case else "其他"
+        chosen_city = form_case.city if form_case else st.session_state.get("city")
+        case_for_chat = CaseFacts(
+            issue_for_chat, chosen_city if chosen_city in cities[1:] else None, context,
+            confirmed_amount=form_case.confirmed_amount if form_case else None,
+            urgent_safety_risk=form_case.urgent_safety_risk if form_case else False,
+            training_progress=form_case.training_progress if form_case else "",
+        )
         st.session_state["case_facts"] = case_for_chat
         st.session_state.pop("analysis_result", None)
         st.session_state["chat_messages"].append({"role": "user", "content": question})
@@ -124,6 +131,7 @@ if case_submitted:
             amount = None
     case = CaseFacts(issue, city if city != "未确定" else None, description.strip(), amount, urgent, training_progress=progress.strip())
     st.session_state["case_facts"] = case
+    st.session_state["form_case_facts"] = case
     st.session_state.pop("analysis_result", None)
 
 case = st.session_state.get("case_facts")
@@ -254,11 +262,7 @@ if result:
             st.download_button(f"下载 {kind.upper()}", data, file_name=f"{doc_type}.{extension}", mime=mime, key=f"download_{kind}")
 
 if st.button("清除本次材料和分析"):
-    for key in ("extracted_documents", "analysis_result", "confirmed_excerpt", "case_facts", "chat_messages", "send_preview", "redaction_values", "confirm_send"):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state):
-        if key.startswith("confirm_send_"):
-            st.session_state.pop(key, None)
+    clear_case_state(st.session_state)
     st.rerun()
 
 

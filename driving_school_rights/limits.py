@@ -31,15 +31,14 @@ def check_request_budget(session_state, config, today=None):
 
 def clear_case_state(session_state):
     sensitive_keys = {
-        "case_facts", "analysis_result", "extracted_documents", "confirmed_excerpt",
-        "send_preview", "redaction_values", "confirm_send", "description",
-        "confirmed_amount", "training_progress", "urgent_safety_risk", "evidence_uploads",
-        "city", "issue", "edited_0", "doc_type",
+        "case_facts", "form_case_facts", "analysis_result", "extracted_documents", "confirmed_excerpt",
+        "chat_messages", "send_preview", "redaction_values", "confirm_send",
         "description", "confirmed_amount", "training_progress", "urgent_safety_risk",
-        "city", "issue", "edited_0", "doc_type",
+        "evidence_uploads", "city", "issue", "doc_type",
     }
     for key in sensitive_keys:
         session_state.pop(key, None)
     for key in list(session_state.keys()):
         if key.startswith(("confirm_send_", "edited_")):
             session_state.pop(key, None)
+

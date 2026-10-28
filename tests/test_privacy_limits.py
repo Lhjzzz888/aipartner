@@ -12,9 +12,12 @@ def _config(session=5, daily=100):
 
 
 def test_clear_case_state_removes_sensitive_fields():
-    state = {"case_facts": "private", "analysis_result": "answer", "extracted_documents": ["upload"], "other": "keep"}
+    state = {"case_facts": "private", "form_case_facts": "private form", "analysis_result": "answer", "extracted_documents": ["upload"],
+             "chat_messages": [{"role": "user", "content": "private"}], "description": "private",
+             "evidence_uploads": ["upload"], "edited_0": "private", "confirm_send_123": True,
+             "analysis_calls": 3, "other": "keep"}
     clear_case_state(state)
-    assert state == {"other": "keep"}
+    assert state == {"analysis_calls": 3, "other": "keep"}
 
 
 def test_session_budget_blocks_excess_calls():
@@ -41,3 +44,4 @@ def test_logging_never_includes_uploaded_text_or_api_key(caplog):
             analyze_case(client, [{"role": "user", "content": "sensitive document"}], "deepseek-chat")
     assert "secret key" not in caplog.text
     assert "sensitive document" not in caplog.text
+

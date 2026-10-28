@@ -92,6 +92,55 @@ def test_chat_question_calls_deepseek_immediately(monkeypatch):
     assert "针对本次提问的事实整理" in app.session_state["chat_messages"][-1]["content"]
 
 
+def test_submitted_case_details_follow_next_chat_question(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    seen = []
+
+    def fake_analysis(client, payload, model):
+        seen.append(payload)
+        return AssistantResult("待核实", [], [], "先联系驾校", [], {}, [])
+
+    monkeypatch.setattr("driving_school_rights.deepseek.analyze_case", fake_analysis)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint).run()
+    app.selectbox[0].set_value("青岛")
+    app.text_area[0].set_value("驾校取消了三次预约")
+    next(box for box in app.text_input if "付款金额" in box.label).set_value("2800")
+    next(box for box in app.text_input if "培训进度" in box.label).set_value("科目二")
+    next(button for button in app.button if button.label == "更新情况与建议").click().run()
+    app.chat_input[0].set_value("现在如何协商？").run()
+    assert not app.exception
+    assert len(seen) == 1
+    assert '"confirmed_amount": 2800.0' in seen[0][1]["content"]
+    assert '"training_progress": "科目二"' in seen[0][1]["content"]
+    assert '"city": "青岛"' in seen[0][1]["content"]
+    assert "驾校取消了三次预约" in seen[0][1]["content"]
+
+
+def test_long_case_description_does_not_hide_latest_question(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    seen = []
+
+    def fake_analysis(client, payload, model):
+        seen.append(payload[1]["content"])
+        return AssistantResult("待核实", [], [], "先联系驾校", [], {}, [])
+
+    monkeypatch.setattr("driving_school_rights.deepseek.analyze_case", fake_analysis)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint)
+    app.session_state["form_case_facts"] = CaseFacts("其他", None, "旧案情" * 1400)
+    app.run()
+    app.chat_input[0].set_value("我刚才的问题是换教练，怎么办？").run()
+    assert not app.exception
+    assert "我刚才的问题是换教练" in seen[0]
+
+
 def test_confirmed_evidence_reaches_analysis(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     fake_openai = ModuleType("openai")
@@ -117,6 +166,20 @@ def test_confirmed_evidence_reaches_analysis(monkeypatch):
     assert any("已进入分析步骤" in error.value for error in app.error)
 
 
+def test_editing_uploaded_excerpt_requires_fresh_consent(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint)
+    app.session_state["case_facts"] = CaseFacts("其他", None, "驾校争议")
+    app.session_state["extracted_documents"] = [ExtractedDocument("记录.txt", "txt", "原始摘录")]
+    app.run()
+    next(box for box in app.checkbox if "确认将其发送给 DeepSeek" in box.label).set_value(True).run()
+    assert next(button for button in app.button if button.label == "确认并分析").disabled is False
+    next(box for box in app.text_area if "识别文字" in box.label).set_value("修改后的摘录").run()
+    assert not app.exception
+    assert next(button for button in app.button if button.label == "确认并分析").disabled is True
+
+
 def test_text_only_case_does_not_require_upload_confirmation(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
@@ -125,4 +188,22 @@ def test_text_only_case_does_not_require_upload_confirmation(monkeypatch):
     app.run()
     assert not app.exception
     assert not any(button.label == "确认并分析" for button in app.button)
+
+
+def test_clear_button_removes_chat_and_uploaded_text(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint)
+    app.session_state["case_facts"] = CaseFacts("其他", None, "私人案情")
+    app.session_state["chat_messages"] = [{"role": "user", "content": "私人案情"}]
+    app.session_state["extracted_documents"] = [ExtractedDocument("合同.txt", "txt", "私人材料")]
+    app.session_state["analysis_calls"] = 2
+    app.session_state["form_case_facts"] = CaseFacts("其他", None, "私人补充信息")
+    app.run()
+    next(button for button in app.button if button.label == "清除本次材料和分析").click().run()
+    assert not app.exception
+    assert not app.session_state.get("chat_messages")
+    assert not app.session_state.get("extracted_documents")
+    assert not app.session_state.get("form_case_facts")
+    assert app.session_state["analysis_calls"] == 2
 
