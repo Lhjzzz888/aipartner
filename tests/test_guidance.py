@@ -1,4 +1,4 @@
-from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, recommend_routes
+from driving_school_rights.guidance import CaseFacts, build_negotiation_plan, quick_chat_reply, recommend_routes
 
 
 def _case(**changes):
@@ -24,3 +24,11 @@ def test_negotiation_plan_uses_confirmed_amounts_only():
 def test_urgent_safety_skips_ordinary_negotiation():
     plan = build_negotiation_plan(_case(urgent_safety_risk=True))
     assert plan.first_step.startswith("先保障人身安全")
+
+
+def test_missing_evidence_reply_suggests_recovery_without_inventing_facts():
+    answer = quick_chat_reply(_case(description="教练态度恶劣，我没留证据"))
+    assert "付款记录" in answer
+    assert "不补造材料" in answer
+    assert "12328" in answer
+
