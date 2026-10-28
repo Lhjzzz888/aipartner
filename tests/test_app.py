@@ -45,10 +45,30 @@ def test_case_intake_renders_routes_without_calling_api(monkeypatch):
     entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
     app = AppTest.from_file(entrypoint).run()
     app.text_area[0].set_value("驾校连续取消预约，想了解退费流程")
-    app.button[0].click().run()
+    next(button for button in app.button if button.label == "更新情况与建议").click().run()
     assert not app.exception
-    assert any("先协商" in heading.value for heading in app.subheader)
-    assert any("12328" in expander.label for expander in app.expander)
+    assert any("详细方案" in heading.value for heading in app.subheader)
+    assert any("12328" in item.value for item in app.markdown)
+
+
+def test_no_contract_question_works_without_upload_or_api_key(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint).run()
+    next(button for button in app.button if "我没有合同" in button.label).click().run()
+    assert not app.exception
+    assert any("没有合同也可以先处理" in item.value for item in app.markdown)
+    assert app.session_state["case_facts"].description == "我没有合同，怎么退费？"
+    assert not app.session_state.get("extracted_documents")
+
+
+def test_chat_input_accepts_question_without_documents(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint).run()
+    app.chat_input[0].set_value("我没留证据，教练态度很差").run()
+    assert not app.exception
+    assert "没留证据，先从今天开始补" in app.session_state["chat_messages"][-1]["content"]
 
 
 def test_confirmed_evidence_reaches_analysis(monkeypatch):
@@ -72,6 +92,25 @@ def test_confirmed_evidence_reaches_analysis(monkeypatch):
     next(box for box in app.checkbox if "确认将其发送给 DeepSeek" in box.label).set_value(True).run()
     next(button for button in app.button if button.label == "确认并分析").click().run()
 
+    assert not app.exception
+    assert any("已进入分析步骤" in error.value for error in app.error)
+
+
+def test_text_only_case_can_reach_analysis(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: object()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setattr(
+        "driving_school_rights.deepseek.analyze_case",
+        lambda *args: (_ for _ in ()).throw(AnalysisError("已进入分析步骤")),
+    )
+    entrypoint = Path(__file__).parents[1] / "driving_school_rights" / "app.py"
+    app = AppTest.from_file(entrypoint)
+    app.session_state["case_facts"] = CaseFacts("其他", None, "没有合同，驾校不退费")
+    app.run()
+    next(box for box in app.checkbox if "确认将其发送给 DeepSeek" in box.label).set_value(True).run()
+    next(button for button in app.button if button.label == "确认并分析").click().run()
     assert not app.exception
     assert any("已进入分析步骤" in error.value for error in app.error)
 
